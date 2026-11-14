@@ -2,9 +2,11 @@
 //! the terminal renderer with the run directory removed afterwards.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bench::app;
@@ -14,6 +16,8 @@ use bench::app::ReportOptions;
 use bench::orchestrator;
 use bench::orchestrator::Planned;
 use bench::progress;
+use bench::provision::MIN_RANGE;
+use bench::provision::Part;
 use bench::registry;
 use bench::registry::Entry;
 use bench::results::Measured;
@@ -134,30 +138,64 @@ fn ids(list: &[&str]) -> Vec<String> {
     list.iter().map(|id| (*id).to_owned()).collect()
 }
 
-/// The downloads of a test run: every address gets `body`, or fails when there is none, and the
-/// addresses asked for are noted.
+/// A download asked for: the address, and the byte range or `None` for the whole file.
+type Asked = (&'static str, Option<Range<u64>>);
+
+/// The downloads of a test run: every address gets `body`, whole or the byte range asked for, or
+/// fails when there is none, and the addresses and ranges asked for are noted. A file comes over
+/// up to `connections` connections, or as many as the program uses by default. With `interrupt`,
+/// a download instead never ends, and Ctrl-C comes meanwhile.
 #[derive(Default)]
 struct Downloads {
     body: Option<&'static [u8]>,
-    asked: Mutex<Vec<&'static str>>,
+    connections: Option<usize>,
+    interrupt: Option<CancellationToken>,
+    asked: Mutex<Vec<Asked>>,
 }
 
 impl Downloads {
-    async fn open(&self, url: &'static str) -> Result<&'static [u8], String> {
+    async fn open(
+        &self,
+        url: &'static str,
+        range: Option<Range<u64>>,
+    ) -> Result<Part<&'static [u8]>, String> {
         self.asked
             .lock()
             .expect("no test panics while holding the addresses")
-            .push(url);
-        self.body
-            .ok_or_else(|| format!("no download in this test: {url}"))
+            .push((url, range.clone()));
+        if let Some(cancel) = &self.interrupt {
+            cancel.cancel();
+            std::future::pending::<()>().await;
+        }
+        let body = self
+            .body
+            .ok_or_else(|| format!("no download in this test: {url}"))?;
+        Ok(match range {
+            Some(range) => {
+                let start = usize::try_from(range.start).expect("in memory");
+                let end = usize::try_from(range.end).expect("in memory");
+                Part::Range(&body[start..end])
+            }
+            None => Part::Whole(body),
+        })
     }
 
     /// The addresses asked for, in order.
     fn asked(&self) -> Vec<&'static str> {
-        self.asked
+        let asked = self
+            .asked
             .lock()
-            .expect("no test panics while holding the addresses")
-            .clone()
+            .expect("no test panics while holding the addresses");
+        asked.iter().map(|(url, _)| *url).collect()
+    }
+
+    /// The byte ranges asked for, in order; `None` for a whole file.
+    fn ranges(&self) -> Vec<Option<Range<u64>>> {
+        let asked = self
+            .asked
+            .lock()
+            .expect("no test panics while holding the addresses");
+        asked.iter().map(|(_, range)| range.clone()).collect()
     }
 }
 
@@ -184,10 +222,21 @@ async fn run(
         width,
         show_ip,
     };
-    let fetch = |url| downloads.open(url);
-    let code = app::execute(planned, host, work.path(), cancel, fetch, report)
-        .await
-        .expect("the run starts");
+    let fetch = |url, range| downloads.open(url, range);
+    let connections = downloads
+        .connections
+        .unwrap_or(usize::from(app::DOWNLOAD_CONNECTIONS));
+    let code = app::execute(
+        planned,
+        host,
+        work.path(),
+        cancel,
+        fetch,
+        connections,
+        report,
+    )
+    .await
+    .expect("the run starts");
     drop(capturing);
     let left = std::fs::read_dir(work.path())
         .expect("the work directory stays")
@@ -212,6 +261,24 @@ fn ids_are_comma_separated_and_work_dir_defaults_to_cwd() {
     assert_eq!(cli.only, ["test.good", "test.other"]);
     assert_eq!(cli.skip, ["test.other"]);
     assert_eq!(cli.work_dir, PathBuf::from("."));
+}
+
+#[test]
+fn a_download_uses_32_connections_unless_told_another_number_from_1_to_256() {
+    use clap::Parser;
+
+    assert_eq!(cli(&[]).download_connections, 32);
+    for number in [1, 7, 256] {
+        let text = number.to_string();
+        assert_eq!(
+            cli(&["--download-connections", &text]).download_connections,
+            number
+        );
+    }
+    for wrong in ["0", "257", "-1", "many"] {
+        let parsed = Cli::try_parse_from(["lowendaff-bench", "--download-connections", wrong]);
+        assert!(parsed.is_err(), "{wrong}");
+    }
 }
 
 #[test]
@@ -644,8 +711,21 @@ async fn tools_of_items_the_host_cannot_run_are_not_downloaded() {
     }
 }
 
-/// A shell script that these tests serve as a tool.
-const SCRIPT: &[u8] = b"#!/bin/sh\necho ok\n";
+/// The size of [`script`]: two byte ranges.
+const SCRIPT_SIZE: u64 = 2 * MIN_RANGE;
+
+/// A shell script that these tests serve as a tool. It says ok, and a comment makes it as large as
+/// two byte ranges, so that it comes in ranges when the run may use two connections.
+fn script() -> &'static [u8] {
+    static SCRIPT: OnceLock<Vec<u8>> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let mut script = b"#!/bin/sh\necho ok\nexit 0\n".to_vec();
+        let size = usize::try_from(SCRIPT_SIZE).expect("in memory");
+        script.resize(size - 1, b'#');
+        script.push(b'\n');
+        script
+    })
+}
 
 const SCRIPT_TOOL: ToolSpec = ToolSpec {
     name: "script",
@@ -655,14 +735,14 @@ const SCRIPT_TOOL: ToolSpec = ToolSpec {
         ToolAsset {
             arch: "x86_64",
             url: "https://example.invalid/script-x86_64",
-            sha256: "b4d644d4279594903f1a9911956432d9473041f2984fc6014c14d7402c7d126c",
-            size: 18,
+            sha256: "ce21818e73a94088130a9c7d7ff04775c27a9a04d96b3b68540f01b49cb1a0df",
+            size: SCRIPT_SIZE,
         },
         ToolAsset {
             arch: "aarch64",
             url: "https://example.invalid/script-aarch64",
-            sha256: "b4d644d4279594903f1a9911956432d9473041f2984fc6014c14d7402c7d126c",
-            size: 18,
+            sha256: "ce21818e73a94088130a9c7d7ff04775c27a9a04d96b3b68540f01b49cb1a0df",
+            size: SCRIPT_SIZE,
         },
     ],
 };
@@ -702,28 +782,63 @@ impl Plugin for RunsScript {
 #[tokio::test]
 async fn the_program_hands_its_plugins_the_tools_it_downloaded() {
     let registry = [entry::<RunsScript>()];
+    let host = || HostProfile {
+        arch: "x86_64".to_owned(),
+        ..HostProfile::default()
+    };
+    let url = "https://example.invalid/script-x86_64";
+    let in_ranges = vec![Some(0..MIN_RANGE), Some(MIN_RANGE..SCRIPT_SIZE)];
+    for (connections, ranges) in [(None, in_ranges), (Some(1), vec![None])] {
+        let planned = app::prepare(&cli(&[]), &registry).unwrap();
+        let downloads = Downloads {
+            body: Some(script()),
+            connections,
+            ..Downloads::default()
+        };
+
+        let cancel = CancellationToken::new();
+        let (code, text, log) = run(planned, host(), &cancel, &downloads, None, false).await;
+
+        assert_eq!(code, 0);
+        assert_eq!(downloads.asked(), vec![url; ranges.len()]);
+        assert_eq!(downloads.ranges(), ranges, "{connections:?} connections");
+        assert!(
+            log.contains(&"准备工具：script 1.0 就绪".to_owned()),
+            "{log:?}"
+        );
+        assert!(
+            summary_line(&text, "test.script").is_some_and(|line| line.contains("完成，用时")),
+            "the plugin ran the tool it was handed: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_downloads_ends_the_run_at_once() {
+    let registry = [entry::<RunsScript>()];
     let planned = app::prepare(&cli(&[]), &registry).unwrap();
     let host = HostProfile {
         arch: "x86_64".to_owned(),
         ..HostProfile::default()
     };
+    let cancel = CancellationToken::new();
     let downloads = Downloads {
-        body: Some(SCRIPT),
+        body: Some(script()),
+        interrupt: Some(cancel.clone()),
         ..Downloads::default()
     };
 
-    let cancel = CancellationToken::new();
     let (code, text, log) = run(planned, host, &cancel, &downloads, None, false).await;
 
-    assert_eq!(code, 0);
+    assert_eq!(code, EXIT_INTERRUPTED);
     assert_eq!(downloads.asked(), ["https://example.invalid/script-x86_64"]);
     assert!(
-        log.contains(&"准备工具：script 1.0 就绪".to_owned()),
+        log.contains(&"准备工具：script 1.0 失败：下载已中断".to_owned()),
         "{log:?}"
     );
     assert!(
-        summary_line(&text, "test.script").is_some_and(|line| line.contains("完成，用时")),
-        "the plugin ran the tool it was handed: {text}"
+        summary_line(&text, "test.script").is_some_and(|line| line.ends_with("已中断")),
+        "{text}"
     );
 }
 
