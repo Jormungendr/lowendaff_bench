@@ -1,16 +1,20 @@
 //! Tool provisioning: download every pinned tool the plan needs before the
 //! first test, verify size and SHA-256, and only then make it executable or unpack it. A large
 //! file comes in byte ranges over several connections at once, when its server serves ranges:
-//! a slow route often limits each connection rather than the host.
+//! a slow route often limits each connection rather than the host. A download that fails in a
+//! way that may pass is tried again after a wait: a byte range from its first missing byte, a
+//! whole file from the start.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::Permissions;
 use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bench_api::CancellationToken;
 use bench_api::Requirements;
@@ -39,12 +43,66 @@ pub struct Provisioned {
 /// comes over one connection.
 pub const MIN_RANGE: u64 = 1 << 20;
 
+/// The attempts that one download, or one byte range of it, gets.
+const ATTEMPTS: u32 = 4;
+
+/// The wait before the first retry; it doubles before each further one.
+const FIRST_WAIT: Duration = Duration::from_secs(1);
+
+/// Why a download failed, in the user's words, and whether another try may go better.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadError {
+    /// It may pass on its own: no answer came, the server was busy or failing for the moment, or
+    /// the body broke off, stalled or ended short.
+    Transient(String),
+    /// Another try would end the same way.
+    Final(String),
+}
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::Transient(reason) | Self::Final(reason)) = self;
+        f.write_str(reason)
+    }
+}
+
 /// What a download returned.
 pub enum Part<R> {
     /// The whole file: asked for so, or the server ignored the byte range that was asked for.
     Whole(R),
     /// Exactly the byte range that was asked for.
     Range(R),
+}
+
+/// The failed attempts at one download, or at one byte range of it, since the count began.
+#[derive(Default)]
+struct Attempts {
+    failed: u32,
+}
+
+impl Attempts {
+    /// After a failed attempt: logs the retry in `retry`'s words and waits, 1, 2 and then 4
+    /// seconds, or gives the reason when the failure would end the same way again or the
+    /// attempts are used up. `retry` gets the number of the attempt that failed and the seconds
+    /// of the wait.
+    async fn again(
+        &mut self,
+        error: DownloadError,
+        retry: impl FnOnce(u32, u64) -> String,
+    ) -> Result<(), String> {
+        let reason = match error {
+            DownloadError::Final(reason) => return Err(reason),
+            DownloadError::Transient(reason) => reason,
+        };
+        self.failed += 1;
+        if self.failed >= ATTEMPTS {
+            return Err(reason);
+        }
+        let wait = FIRST_WAIT * 2_u32.pow(self.failed - 1);
+        tracing::debug!("{}：{reason}", retry(self.failed, wait.as_secs()));
+        tokio::time::sleep(wait).await;
+        Ok(())
+    }
 }
 
 /// Unique tools needed by the planned plugins, in plan order.
@@ -62,9 +120,9 @@ pub fn required_tools(requirements: impl IntoIterator<Item = Requirements>) -> V
 
 /// Installs every tool into `dir`, and logs how each one went. `fetch` opens the download for a
 /// URL, the whole file or a byte range of it (HTTPS in production, an in-memory body in tests),
-/// and returns a user-facing error on failure. A file comes over up to `connections`
-/// connections at once, one byte range each. When `cancel` fires, the download under way stops
-/// at once and fails, and the tools after it are not downloaded.
+/// and says why it failed. A file comes over up to `connections` connections at once, one byte
+/// range each. When `cancel` fires, the download under way stops at once and fails, and the
+/// tools after it are not downloaded.
 pub async fn provision_all<F, Fut, R>(
     tools: &[ToolSpec],
     arch: &str,
@@ -75,7 +133,7 @@ pub async fn provision_all<F, Fut, R>(
 ) -> Provisioned
 where
     F: Fn(&'static str, Option<Range<u64>>) -> Fut,
-    Fut: Future<Output = Result<Part<R>, String>>,
+    Fut: Future<Output = Result<Part<R>, DownloadError>>,
     R: AsyncRead + Unpin,
 {
     let mut result = Provisioned::default();
@@ -116,7 +174,7 @@ async fn download<F, Fut, R>(
 ) -> Result<PathBuf, String>
 where
     F: Fn(&'static str, Option<Range<u64>>) -> Fut,
-    Fut: Future<Output = Result<Part<R>, String>>,
+    Fut: Future<Output = Result<Part<R>, DownloadError>>,
     R: AsyncRead + Unpin,
 {
     let partial = partial_path(dir, tool);
@@ -127,9 +185,11 @@ where
     finish(written, &partial, tool, dir).await
 }
 
-/// Fetches `asset` into `path` and checks its size and SHA-256: over one connection, or, when
-/// the file is large enough and its server serves byte ranges, one range per connection, up to
-/// `connections` at once.
+/// Fetches `asset` into `path` and checks its size and SHA-256: a file under two byte ranges
+/// whole, over one connection; a larger one, when its server serves byte ranges, one range per
+/// connection, up to `connections` at once. With one connection, a larger file is one range, so
+/// that it can continue after a break. Failures before the first answer count against the first
+/// range.
 async fn fetch_checked<F, Fut, R>(
     fetch: &F,
     tool: &ToolSpec,
@@ -139,32 +199,90 @@ async fn fetch_checked<F, Fut, R>(
 ) -> Result<(), String>
 where
     F: Fn(&'static str, Option<Range<u64>>) -> Fut,
-    Fut: Future<Output = Result<Part<R>, String>>,
+    Fut: Future<Output = Result<Part<R>, DownloadError>>,
     R: AsyncRead + Unpin,
 {
-    let ranges = ranges(asset.size, connections);
-    if ranges.len() < 2 {
-        let (Part::Whole(body) | Part::Range(body)) = fetch(asset.url, None).await?;
-        return write_verified(body, asset, path).await;
+    if asset.size < 2 * MIN_RANGE {
+        return fetch_whole(fetch, tool, asset, path, None).await;
     }
-    match fetch(asset.url, Some(ranges[0].clone())).await? {
+    let ranges = ranges(asset.size, connections);
+    let mut attempts = Attempts::default();
+    let first = loop {
+        match fetch(asset.url, Some(ranges[0].clone())).await {
+            Ok(part) => break part,
+            Err(error) => {
+                attempts
+                    .again(error, |failed, wait| whole_retry(tool, failed, wait))
+                    .await?
+            }
+        }
+    };
+    match first {
         Part::Whole(body) => {
             tracing::debug!(
                 "{} {}：服务器不支持分段下载，改用一个连接",
                 tool.name,
                 tool.version
             );
-            write_verified(body, asset, path).await
+            fetch_whole(fetch, tool, asset, path, Some((body, attempts))).await
         }
-        Part::Range(first) => {
-            tracing::debug!(
-                "{} {} 分 {} 段同时下载",
-                tool.name,
-                tool.version,
-                ranges.len()
-            );
-            write_ranges(fetch, first, &ranges, asset, path).await
+        Part::Range(body) => {
+            if ranges.len() > 1 {
+                tracing::debug!(
+                    "{} {} 分 {} 段同时下载",
+                    tool.name,
+                    tool.version,
+                    ranges.len()
+                );
+            }
+            write_ranges(fetch, tool, asset, path, &ranges, (body, attempts)).await
         }
+    }
+}
+
+/// The words of the -v log for another try at a whole download.
+fn whole_retry(tool: &ToolSpec, failed: u32, wait: u64) -> String {
+    format!(
+        "{} {} 第 {failed} 次下载未成功，{wait} 秒后重试",
+        tool.name, tool.version
+    )
+}
+
+/// Fetches the whole of `asset` into `path` over one connection, beginning with `first`, an
+/// answer that has come already and the attempts that it took. After a failure that may pass,
+/// it starts over.
+async fn fetch_whole<F, Fut, R>(
+    fetch: &F,
+    tool: &ToolSpec,
+    asset: &ToolAsset,
+    path: &Path,
+    first: Option<(R, Attempts)>,
+) -> Result<(), String>
+where
+    F: Fn(&'static str, Option<Range<u64>>) -> Fut,
+    Fut: Future<Output = Result<Part<R>, DownloadError>>,
+    R: AsyncRead + Unpin,
+{
+    let (mut body, mut attempts) = match first {
+        Some((body, attempts)) => (Some(body), attempts),
+        None => (None, Attempts::default()),
+    };
+    loop {
+        let written = match body.take() {
+            Some(body) => write_verified(body, asset, path).await,
+            None => match fetch(asset.url, None).await {
+                Ok(Part::Whole(body) | Part::Range(body)) => {
+                    write_verified(body, asset, path).await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        let Err(error) = written else {
+            return Ok(());
+        };
+        attempts
+            .again(error, |failed, wait| whole_retry(tool, failed, wait))
+            .await?;
     }
 }
 
@@ -197,7 +315,9 @@ pub async fn install<R: AsyncRead + Unpin>(
     dir: &Path,
 ) -> Result<PathBuf, String> {
     let partial = partial_path(dir, tool);
-    let written = write_verified(body, asset, &partial).await;
+    let written = write_verified(body, asset, &partial)
+        .await
+        .map_err(|err| err.to_string());
     finish(written, &partial, tool, dir).await
 }
 
@@ -229,16 +349,19 @@ async fn finish(
     outcome
 }
 
+/// Streams `body`, the whole file, into `path`, and checks its size and SHA-256. A body that
+/// breaks off or ends short may come whole on another try; one that grows past the pinned size,
+/// or holds other bytes, would not.
 async fn write_verified<R: AsyncRead + Unpin>(
     mut body: R,
     asset: &ToolAsset,
     path: &Path,
-) -> Result<(), String> {
+) -> Result<(), DownloadError> {
     use sha2::Digest;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
-    let write_error = |err: io::Error| format!("无法写入：{err}");
+    let write_error = |err: io::Error| DownloadError::Final(format!("无法写入：{err}"));
     let mut file = File::create(path).await.map_err(write_error)?;
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
@@ -247,102 +370,164 @@ async fn write_verified<R: AsyncRead + Unpin>(
         let read = body
             .read(&mut buffer)
             .await
-            .map_err(|err| format!("下载中断：{err}"))?;
+            .map_err(|err| DownloadError::Transient(format!("下载中断：{err}")))?;
         if read == 0 {
             break;
         }
         total += read as u64;
         if total > asset.size {
-            return Err(format!("大小超过声明的 {} 字节", asset.size));
+            return Err(DownloadError::Final(format!(
+                "大小超过声明的 {} 字节",
+                asset.size
+            )));
         }
         hasher.update(&buffer[..read]);
         file.write_all(&buffer[..read]).await.map_err(write_error)?;
     }
     file.flush().await.map_err(write_error)?;
     if total != asset.size {
-        return Err(format!(
+        return Err(DownloadError::Transient(format!(
             "大小不符：应为 {} 字节，实际 {total} 字节",
             asset.size
-        ));
+        )));
     }
-    pinned(hasher, asset)
+    pinned(hasher, asset).map_err(DownloadError::Final)
 }
 
-/// Writes the byte `ranges` of `asset` into `path`, all at once: the first from `first`, which
-/// its server has begun to send, every other over a connection of its own. Then checks the whole
-/// file's SHA-256.
+/// Writes the byte `ranges` of `asset` into `path`, all at once, each over a connection of its
+/// own, the first beginning with `first`: its server's answer and the attempts that it took. Then
+/// checks the whole file's SHA-256.
 async fn write_ranges<F, Fut, R>(
     fetch: &F,
-    first: R,
-    ranges: &[Range<u64>],
+    tool: &ToolSpec,
     asset: &ToolAsset,
     path: &Path,
+    ranges: &[Range<u64>],
+    first: (R, Attempts),
 ) -> Result<(), String>
 where
     F: Fn(&'static str, Option<Range<u64>>) -> Fut,
-    Fut: Future<Output = Result<Part<R>, String>>,
+    Fut: Future<Output = Result<Part<R>, DownloadError>>,
     R: AsyncRead + Unpin,
 {
     File::create(path)
         .await
         .map_err(|err| format!("无法写入：{err}"))?;
-    let others = ranges[1..].iter().map(|range| async move {
-        match fetch(asset.url, Some(range.clone())).await? {
-            Part::Range(body) => write_range(body, range, path).await,
-            Part::Whole(_) => Err("下载失败：服务器不再分段返回".to_owned()),
-        }
-    });
+    let others = ranges
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, range)| fetch_range(fetch, tool, asset, path, index, range, None));
     futures_util::future::try_join(
-        write_range(first, &ranges[0], path),
+        fetch_range(fetch, tool, asset, path, 0, &ranges[0], Some(first)),
         futures_util::future::try_join_all(others),
     )
     .await?;
     check(asset, path).await
 }
 
-/// Writes `body`, which holds the byte `range` of a file, at its place in `path`; it must hold
-/// exactly that many bytes.
+/// Fetches the byte `range` of `asset`, numbered `index` from 0, into its place in `path`,
+/// beginning with `first`, an answer that has come already and the attempts that it took. After
+/// a failure that may pass, it asks again from the first missing byte; an attempt that brought
+/// [`MIN_RANGE`] bytes or more starts the count afresh, so that a long download that breaks now
+/// and then goes on.
+async fn fetch_range<F, Fut, R>(
+    fetch: &F,
+    tool: &ToolSpec,
+    asset: &ToolAsset,
+    path: &Path,
+    index: usize,
+    range: &Range<u64>,
+    first: Option<(R, Attempts)>,
+) -> Result<(), String>
+where
+    F: Fn(&'static str, Option<Range<u64>>) -> Fut,
+    Fut: Future<Output = Result<Part<R>, DownloadError>>,
+    R: AsyncRead + Unpin,
+{
+    let (mut body, mut attempts) = match first {
+        Some((body, attempts)) => (Some(body), attempts),
+        None => (None, Attempts::default()),
+    };
+    let mut written = 0;
+    loop {
+        let before = written;
+        let result = match body.take() {
+            Some(body) => write_range(body, range, &mut written, path).await,
+            None => match fetch(asset.url, Some(range.start + written..range.end)).await {
+                Ok(Part::Range(body)) => write_range(body, range, &mut written, path).await,
+                Ok(Part::Whole(_)) => Err(DownloadError::Final(
+                    "下载失败：服务器不再分段返回".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
+        };
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if written - before >= MIN_RANGE {
+            attempts = Attempts::default();
+        }
+        let resume = range.start + written;
+        let range_retry = |failed, wait| {
+            format!(
+                "{} {} 第 {} 段第 {failed} 次下载未成功，{wait} 秒后从第 {resume} 字节续传",
+                tool.name,
+                tool.version,
+                index + 1
+            )
+        };
+        attempts.again(error, range_retry).await?;
+    }
+}
+
+/// Writes `body` into the byte `range` of `path`, after the `written` bytes of it that are there
+/// already, and adds to `written` what it writes; the range must come to exactly its length. A
+/// body that breaks off or ends short may come whole on another try; one that runs long would
+/// not.
 async fn write_range<R: AsyncRead + Unpin>(
     mut body: R,
     range: &Range<u64>,
+    written: &mut u64,
     path: &Path,
-) -> Result<(), String> {
+) -> Result<(), DownloadError> {
     use std::io::SeekFrom;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncSeekExt;
     use tokio::io::AsyncWriteExt;
 
-    let write_error = |err: io::Error| format!("无法写入：{err}");
+    let write_error = |err: io::Error| DownloadError::Final(format!("无法写入：{err}"));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .open(path)
         .await
         .map_err(write_error)?;
-    file.seek(SeekFrom::Start(range.start))
+    file.seek(SeekFrom::Start(range.start + *written))
         .await
         .map_err(write_error)?;
     let length = range.end - range.start;
-    let mut total: u64 = 0;
     let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = body
-            .read(&mut buffer)
-            .await
-            .map_err(|err| format!("下载中断：{err}"))?;
-        if read == 0 {
-            break;
-        }
-        total += read as u64;
-        if total > length {
-            return Err(format!("大小超过一段应有的 {length} 字节"));
+    let ended = loop {
+        let read = match body.read(&mut buffer).await {
+            Ok(0) => break Ok(()),
+            Ok(read) => read,
+            Err(err) => break Err(DownloadError::Transient(format!("下载中断：{err}"))),
+        };
+        if *written + read as u64 > length {
+            break Err(DownloadError::Final(format!(
+                "大小超过一段应有的 {length} 字节"
+            )));
         }
         file.write_all(&buffer[..read]).await.map_err(write_error)?;
-    }
+        *written += read as u64;
+    };
+    // What came before a break stays, and the next try goes on after it.
     file.flush().await.map_err(write_error)?;
-    if total != length {
-        return Err(format!(
-            "大小不符：一段应为 {length} 字节，实际 {total} 字节"
-        ));
+    ended?;
+    if *written != length {
+        return Err(DownloadError::Transient(format!(
+            "大小不符：一段应为 {length} 字节，实际 {written} 字节"
+        )));
     }
     Ok(())
 }
