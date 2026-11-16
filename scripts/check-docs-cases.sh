@@ -22,15 +22,23 @@ write() {
     git add "$1"
 }
 
-glossary_head='# Glossary
+# write_bytes <path> <octal escapes>: writes the bytes, with a final newline, and stages the file.
+# This file holds no CJK character itself: the cases write them as escapes.
+write_bytes() {
+    mkdir -p "$(dirname "$1")"
+    # shellcheck disable=SC2059 # the format is the escapes
+    printf "$2\n" > "$1"
+    git add "$1"
+}
 
-| Chinese | English | Where it appears |
-|---------|---------|------------------|'
-write glossary.md "$glossary_head
-| 完成 | Completed | an item's last line |
-| CPU 性能 | CPU performance | an item's title |"
-write crates/bench/src/lib.rs 'pub const DONE: &str = "完成";'
-write plugins/cpu/src/lib.rs 'pub const TITLE: &str = "CPU 性能";'
+# Chinese, Japanese kana, a rare ideograph, Korean, fullwidth punctuation, an emoji.
+chinese='\344\270\255\346\226\207'
+kana='\343\203\206\343\202\271\343\203\210'
+rare='\343\220\200'
+korean='\355\225\234\352\265\255\354\226\264'
+comma='\357\274\214'
+emoji='\360\237\230\200'
+
 write README.md '# readme
 
 Two × 3 at 25 °C — fine… These are not CJK. The design of the tool, and its designated runs.'
@@ -72,79 +80,53 @@ check() {
 
 check accept 'the base, with other non-ASCII characters and the word design'
 
-write glossary.md "$glossary_head
-| 完成 | Completed | an item's last line |
-| 未知 | Unknown | a value |
-| CPU 性能 | CPU performance | an item's title |"
-check reject 'a term that the source does not have' '"未知" no longer appears'
-
-write glossary.md "$glossary_head
-| 未知 | Unknown | a value |
-| 完成 | Completed | an item's last line |"
-check reject 'the first term, missing from the source' '"未知" no longer appears'
-
-write glossary.md "$glossary_head
-| --- | --- | --- |
-| 完成 | Completed | an item's last line |"
-check accept 'a second separator, written with spaces'
-
-write glossary.md "$glossary_head
-| 跳过 | Skipped | an item's last line |"
-write crates/bench/src/lib.rs '// 跳过
-/// 跳过
-    //! 跳过'
-check reject 'a term only in comments' '"跳过" no longer appears'
-
-write glossary.md "$glossary_head
-| 跳过 | Skipped | an item's last line |"
-write crates/bench/tests/flow.rs 'const SKIPPED: &str = "跳过";'
-write crates/bench/examples/run.rs 'const SKIPPED: &str = "跳过";'
-check reject 'a term only in tests and examples' '"跳过" no longer appears'
-
-write glossary.md "$glossary_head
-| 跳过 | Skipped | an item's last line |"
-write crates/bench-host/tests/fixtures/src/lib.rs 'const SKIPPED: &str = "跳过";'
-check reject 'a term in a path that only looks like source' '"跳过" no longer appears'
-
-write glossary.md "$glossary_head
-| 跳过 | Skipped | an item's last line |"
-write plugins/cpu/src/report/terminal.rs '    let skipped = "跳过：没有网络"; // a reason follows'
-check accept 'a term in a module deeper in the source'
-
-write glossary.md '# Glossary
-
-| 中文 | English | Where |
-|------|---------|-------|
-| 完成 | Completed | an item'"'"'s last line |'
-check reject 'a glossary with another header' 'must start with the header'
-
-write glossary.md "$glossary_head"
-check reject 'a glossary without terms' 'has no terms' 'a row without a term'
-
-write glossary.md "$glossary_head
-|  | Completed | an item's last line |"
-check reject 'a row without a term' 'a row without a term'
-
 for file in README.md CONTRIBUTING.md .github/pull_request_template.md; do
-    write "$file" '运行环境 KVM 虚拟机'
+    write_bytes "$file" "Environment: $chinese"
     check reject "Chinese in $file" "$file:1:"
 done
-write README.md 'テスト'
+write_bytes README.md "$kana"
 check reject 'Japanese kana' 'README.md:1:'
-write README.md '㐀'
+write_bytes README.md "$rare"
 check reject 'a rare ideograph' 'README.md:1:'
-# U+F900, written as bytes: editors may normalize it to the ordinary ideograph U+8C48.
-printf '\357\244\200\n' > README.md
-git add README.md
+# U+F900, which editors may normalize to the ordinary ideograph U+8C48.
+write_bytes README.md '\357\244\200'
 check reject 'a compatibility ideograph' 'README.md:1:'
-write README.md '한국어'
+write_bytes README.md "$korean"
 check reject 'Korean' 'README.md:1:'
-write README.md 'ok，fine'
+write_bytes README.md "ok${comma}fine"
 check reject 'fullwidth punctuation' 'README.md:1:'
+
+write_bytes crates/bench/src/lib.rs "pub const DONE: &str = \"$chinese\";"
+check reject 'Chinese in a string of the program' 'crates/bench/src/lib.rs:1:'
+write_bytes plugins/cpu/src/lib.rs "//! The $chinese test item."
+check reject 'Chinese in a comment' 'plugins/cpu/src/lib.rs:1:'
+write_bytes crates/bench/tests/report.rs "const SHOWN: &str = \"$chinese\";"
+check reject 'Chinese in a test' 'crates/bench/tests/report.rs:1:'
+write_bytes crates/bench/tests/snapshots/report__all.snap "[$chinese]"
+check reject 'Chinese in a snapshot' 'report__all.snap:1:'
+write_bytes plugins/disk/tests/fixtures/fio/output.txt "fio: $chinese"
+check reject 'Chinese in fixture data' 'output.txt:1:'
+write_bytes scripts/smoke.sh "grep -q '$chinese'"
+check reject 'Chinese in a script' 'scripts/smoke.sh:1:'
+write_bytes crates/bench/src/locale/en/report.rs "\"$chinese\""
+check reject 'Chinese in the English catalog' 'locale/en/report.rs:1:'
+write_bytes crates/bench/src/locale/report.rs "/// $chinese"
+check reject "Chinese beside the catalogs, in the traits" 'locale/report.rs:1:'
+write_bytes crates/bench/src/locale/zh.rs "\"$chinese\""
+check reject 'a catalog that is not a directory of its own' 'locale/zh.rs:1:'
+write_bytes plugins/cpu/src/locale/zh/report.rs "\"$chinese\""
+check reject 'a catalog outside the program' 'plugins/cpu/src/locale/zh/report.rs:1:'
+write_bytes crates/bench/src/locale/zh/report.rs "\"$chinese\""
+write_bytes crates/bench/src/locale/zh/host.rs "\"$kana$korean$comma\""
+check accept 'the catalog of another language'
+# A degree sign, a dash, a multiplication sign and the emoji.
+other="25 \302\260C \342\200\224 2 \303\227 3 $emoji"
+write_bytes crates/bench/src/lib.rs "pub const SHOWN: &str = \"$other\";"
+check accept 'other characters outside ASCII in the program'
 
 write scripts/build.sh '# The flags follow docs/design/cpu.md.'
 check reject 'a path to the design documents' 'scripts/build.sh:1:'
-write crates/bench/src/lib.rs 'pub const DONE: &str = "完成"; // (§5.3)'
+write crates/bench/src/lib.rs 'pub const DONE: &str = "done"; // (§5.3)'
 check reject 'a section sign' 'crates/bench/src/lib.rs:1:'
 for id in D-16 P-11 S-22 DK-02 DH-08 CP-07 ME-09 R-19 H-01; do
     write README.md "Because of $id, it runs last."
@@ -176,24 +158,16 @@ cp "$here/check-docs-cases.sh" scripts/check-docs-cases.sh
 git add scripts
 check accept 'the checker and its cases, which hold the patterns'
 
-# A git whose grep fails, as one without Perl-compatible patterns would, must stop the check:
-# first only for the Perl-compatible searches, then only for the fixed-string ones.
+# A git whose grep fails, as one without Perl-compatible patterns would, must stop the check.
 mkdir "$scratch/bin"
 real_git=$(command -v git)
-for option in -P -F; do
-    # shellcheck disable=SC2016 # $* and $@ belong to the fake git, which expands them
-    printf '#!/bin/sh\ncase " $* " in *" grep "*" %s "*) exit 128 ;; esac\nexec %s "$@"\n' \
-        "$option" "$real_git" > "$scratch/bin/git"
-    chmod +x "$scratch/bin/git"
-    fake_path="$scratch/bin:$PATH"
-    check reject "a git grep $option that fails" 'git grep failed'
-    fake_path=
-done
-
-write glossary.md "$glossary_head
-| 完.成 | Completed | an item's last line |"
-write crates/bench/src/lib.rs 'pub const DONE: &str = "完X成";'
-check reject 'a term with a pattern character, matched literally' '"完.成" no longer appears'
+# shellcheck disable=SC2016 # $* and $@ belong to the fake git, which expands them
+printf '#!/bin/sh\ncase " $* " in *" grep "*" -P "*) exit 128 ;; esac\nexec %s "$@"\n' \
+    "$real_git" > "$scratch/bin/git"
+chmod +x "$scratch/bin/git"
+fake_path="$scratch/bin:$PATH"
+check reject 'a git grep -P that fails' 'git grep failed'
+fake_path=
 
 if [ "$failures" -gt 0 ]; then
     echo "check-docs-cases: $failures of $cases cases failed" >&2

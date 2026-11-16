@@ -7,8 +7,16 @@ recorded in design documents outside the repository.
 ## Languages
 
 - Code, identifiers, comments, documents and commit messages are English.
-- Text that the program shows its users is Chinese; messages for developers, such as the
-  registry checks, are English.
+- Text that the program shows its users is English, and comes from the message catalog in
+  `crates/bench/src/locale/`: a trait per part of the program, which each language implements
+  in a module of its own. Messages for developers, such as the registry checks, are English and
+  written in place.
+- Another language is one more module, `crates/bench/src/locale/<language>/`, that implements
+  every trait, listed in `LOCALES`; the compiler names each text it still lacks. The locale comes
+  from `LC_ALL`, `LC_MESSAGES` or `LANG`. The tests expect the English catalog, which
+  `LC_ALL=C` selects.
+- No tracked file holds a CJK character, so that tests, fixtures and comments stay English too
+  (`scripts/check-docs.sh`); only the catalog of another language holds its words.
 - Pull request bodies are English, in the sections of the template.
 
 ## Layout
@@ -20,7 +28,8 @@ crates/
   bench-tool/  the pins of the external tools, and the code that runs a tool with a time limit,
                cancellation, retries, process groups and CPU placement
   bench/       the program: the command line, the registry, the orchestrator, the result enum,
-               the report, the progress log, the network checks and the tool downloads
+               the report, the progress log, the network checks, the tool downloads and the
+               message catalog
   swap-file/   a temporary swap file, with the only unsafe code
 plugins/
   cpu/         cpu.sysbench, cpu.geekbench
@@ -59,10 +68,11 @@ A new test item starts with a design document (below). Then:
    progress lines tell the log what it is doing.
 2. Add its variant to `Measured` in `crates/bench/src/results.rs`, and register it with that
    variant in `registry::all()`, where its place is its place in the run order.
-3. Name it in the reporter's `NAMES`, and write its words in
-   `crates/bench/src/report/terminal/<group>.rs`; the registry's checks fail for a plugin
-   without a name, and a variant without words does not compile. A new group also gets its
-   section in `SECTIONS`, which orders the report.
+3. Name it in the catalog's `item_name`, and write its part of the report in
+   `crates/bench/src/report/terminal/<group>.rs`, with its words in the catalog; the registry's
+   checks fail for a plugin without a name, and a variant without a report does not compile. A
+   new group also gets its section in `SECTIONS`, which orders the report, and its title in the
+   catalog's `group_title`.
 4. Test the parsers with recorded output, the measurement with recorded runs, comparing each
    tool's whole command, and the words with insta snapshots in `crates/bench/tests/`.
 5. Add the item to the README's table of items, and its tool to the table of third-party tools;
@@ -70,7 +80,7 @@ A new test item starts with a design document (below). Then:
    `crates/bench-tool`.
 6. A new group's crate depends on `bench-api` and `bench-tool` along the direction below: it
    joins their `wrappers` lists in `deny.toml` and gets an entry of its own, used by `bench`
-   alone. The rules against printing and against Chinese strings cover `plugins/*/src` already.
+   alone. The rule against printing covers `plugins/*/src` already.
 
 ## Code
 
@@ -105,8 +115,8 @@ used), with these rules of this repository:
   depend on each of them; a new dependency along the direction is added there.
 - Plugins and the shared crates return data, and the reporter in `bench` formats it: `deny.toml`
   allows comfy-table, which draws the report's tables, in `bench` only. The words the user reads
-  are the reporter's too: `bench-api`, `bench-host`, `bench-tool` and the plugin crates hold no
-  Chinese string (rule `no-chinese-outside-the-reporter`), except in progress lines.
+  are the catalog's too: a plugin returns numbers and kinds of reasons, with the tools' and the
+  system's own messages, and names the step it starts with a `Step`, which holds no words.
 - Only `bench` connects anywhere: it downloads the tools and asks for the public addresses, and
   `deny.toml` allows reqwest there only. Host facts are read from files.
 - Besides clippy's defaults, the lint gate checks `must_use_candidate`, `needless_for_each`,

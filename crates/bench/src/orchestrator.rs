@@ -16,6 +16,7 @@ use bench_api::Net;
 use bench_api::Plugin;
 use bench_api::Progress;
 use bench_api::Requirements;
+use bench_api::Step;
 use bench_api::Stop;
 use bench_api::ToolRun;
 use bench_host::glibc::GlibcVersion;
@@ -25,6 +26,7 @@ use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::locale;
 use crate::registry::Entry;
 use crate::results::Measured;
 use crate::results::Report;
@@ -151,8 +153,8 @@ impl<R> Planned<R> {
 pub trait Observer<R>: Send {
     /// A plugin starts.
     fn on_start(&mut self, _id: &'static str) {}
-    /// A plugin reports progress.
-    fn on_progress(&mut self, _id: &'static str, _line: &str) {}
+    /// A plugin starts a step.
+    fn on_progress(&mut self, _id: &'static str, _step: Step) {}
     /// A plugin ran a tool.
     fn on_tool(&mut self, _id: &'static str, _run: &ToolRun) {}
     /// A plugin's run is over, or it never started.
@@ -190,17 +192,17 @@ pub fn plan(
     let mut errors: Vec<String> = config
         .keys()
         .filter(|key| !registry.iter().any(|entry| entry.id == key.as_str()))
-        .map(|key| format!("配置文件中有未知测试项 `{key}`"))
+        .map(|key| locale::words().config_unknown_item(key))
         .collect();
     let mut planned = Vec::new();
     for id in selection {
         let Some(entry) = registry.iter().find(|entry| entry.id == *id) else {
-            errors.push(format!("未知测试项 `{id}`"));
+            errors.push(locale::words().unknown_item(id));
             continue;
         };
         match entry.build(config.get(*id)) {
             Ok(plugin) => planned.push(plugin),
-            Err(err) => errors.push(format!("测试项 {id} 的配置无效：{err}")),
+            Err(err) => errors.push(locale::words().config_invalid(id, &err)),
         }
     }
     if errors.is_empty() {
@@ -211,7 +213,7 @@ pub fn plan(
 }
 
 /// Splits the plan by host: the plugins that apply here, and the names of those that do not, for
-/// the 本机不适用 line.
+/// the summary's "Not applicable here" line.
 #[must_use]
 pub fn for_host<R>(
     plan: Vec<Planned<R>>,
@@ -485,7 +487,7 @@ impl<P: Plugin, R: Send + 'static> Runner<R> for PluginRunner<P, R> {
 /// Hands a plugin's progress to the observer.
 fn tell<R>(observer: &mut dyn Observer<R>, id: &'static str, progress: Progress) {
     match progress {
-        Progress::Line(line) => observer.on_progress(id, &line),
+        Progress::Step(step) => observer.on_progress(id, step),
         Progress::Tool(run) => observer.on_tool(id, &run),
     }
 }
@@ -514,5 +516,5 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
         .downcast_ref::<&str>()
         .map(|message| (*message).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "（非文本的 panic 信息）".into())
+        .unwrap_or_else(|| locale::words().panic_without_text())
 }
