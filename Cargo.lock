@@ -85,6 +85,7 @@ dependencies = [
  "plugin-cpu",
  "plugin-disk",
  "plugin-memory",
+ "plugin-network",
  "reqwest",
  "rustix",
  "rustls",
@@ -930,6 +931,18 @@ dependencies = [
  "bench-host",
  "bench-tool",
  "serde",
+ "tokio",
+]
+
+[[package]]
+name = "plugin-network"
+version = "0.1.0"
+dependencies = [
+ "bench-api",
+ "bench-host",
+ "bench-tool",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
