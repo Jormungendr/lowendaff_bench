@@ -1,6 +1,7 @@
 //! Tool provisioning: download every pinned tool the plan needs before the
-//! first test, verify size and SHA-256, and only then make it executable or unpack it; and the
-//! files that the plugins ask for, which are not pinned, only limited in size. A large
+//! first test, verify size and SHA-256, and only then make it executable or unpack it, and give
+//! a tool that sends raw packets CAP_NET_RAW; and the files that the plugins ask for, which are
+//! not pinned, only limited in size. A large
 //! file comes in byte ranges over several connections at once, when its server serves ranges:
 //! a slow route often limits each connection rather than the host. A download that fails in a
 //! way that may pass is tried again after a wait: a byte range from its first missing byte, a
@@ -20,6 +21,7 @@ use std::time::Duration;
 use bench_api::CancellationToken;
 use bench_api::FileSource;
 use bench_api::FileSpec;
+use bench_api::IpFamily;
 use bench_api::Requirements;
 use bench_api::ToolAsset;
 use bench_api::ToolForm;
@@ -166,9 +168,16 @@ where
         if cancel.is_cancelled() {
             break;
         }
-        let installed = match tool.asset_for(arch) {
-            None => Err(locale::words().no_build(arch)),
-            Some(asset) => {
+        // A tool that needs raw sockets is not downloaded where it could not have them.
+        let possible = if tool.raw_sockets {
+            raw_sockets_possible(dir)
+        } else {
+            Ok(())
+        };
+        let installed = match (tool.asset_for(arch), possible) {
+            (None, _) => Err(locale::words().no_build(arch)),
+            (Some(_), Err(reason)) => Err(reason),
+            (Some(asset), Ok(())) => {
                 tracing::debug!("{}", locale::words().download(asset.url));
                 download(&fetch, tool, asset, dir, connections, cancel).await
             }
@@ -188,16 +197,19 @@ where
 
 /// Gets the files that a plugin asked for: a file on the host is handed on as it is, and one at
 /// an HTTPS address is downloaded into `dir`, whole, at most [`FILE_LIMIT`] bytes, and tried again
-/// after a failure that may pass, as a tool is. When `cancel` fires, the download under way stops
-/// at once and fails, and the files after it are not downloaded.
+/// after a failure that may pass, as a tool is, over the file's family alone when it names one.
+/// A file of a family that is not among `families`, those that the host reaches, is not fetched.
+/// When `cancel` fires, the download under way stops at once and fails, and the files after it
+/// are not downloaded.
 pub async fn fetch_files<F, Fut, R>(
     files: &[FileSpec],
     dir: &Path,
+    families: &[IpFamily],
     cancel: &CancellationToken,
     fetch: &F,
 ) -> Provisioned
 where
-    F: Fn(&'static str, Option<Range<u64>>) -> Fut,
+    F: Fn(Option<IpFamily>, &'static str, Option<Range<u64>>) -> Fut,
     Fut: Future<Output = Result<Part<R>, DownloadError>>,
     R: AsyncRead + Unpin,
 {
@@ -206,19 +218,23 @@ where
         if cancel.is_cancelled() {
             break;
         }
-        let had = match &file.source {
-            FileSource::Path(path) => Ok(path.clone()),
-            FileSource::Url(url) if !url.starts_with("https://") => {
+        let had = match (&file.source, file.family) {
+            (FileSource::Path(path), _) => Ok(path.clone()),
+            (FileSource::Url(_), Some(family)) if !families.contains(&family) => {
+                Err(locale::words().family_unreachable(family))
+            }
+            (FileSource::Url(url), _) if !url.starts_with("https://") => {
                 Err(locale::words().not_https(url))
             }
-            FileSource::Url(url) => {
+            (FileSource::Url(url), _) => {
                 tracing::debug!("{}", locale::words().download(url));
                 // The fetch takes an address that lasts as long as the program, as a tool's
                 // pinned one does; a file's comes from the configuration, so it is kept to the end.
                 let url: &'static str = Box::leak(url.clone().into_boxed_str());
                 let path = dir.join(file.name);
+                let over = |url, range| fetch(file.family, url, range);
                 let fetched = tokio::select! {
-                    fetched = fetch_file(fetch, file.name, url, &path, dir) => fetched,
+                    fetched = fetch_file(&over, file.name, url, &path, dir) => fetched,
                     () = cancel.cancelled() => Err(locale::words().download_interrupted()),
                 };
                 if fetched.is_err() {
@@ -464,7 +480,71 @@ async fn finish(
     };
     // Left only after a failure, or as the archive that is unpacked now.
     let _ = fs::remove_file(partial).await;
-    outcome
+    match outcome {
+        Ok(path) if tool.raw_sockets => grant_raw_sockets(&path).map(|()| path),
+        outcome => outcome,
+    }
+}
+
+/// The file capability that gives a tool raw sockets, `cap_net_raw+ep`, as `setcap` writes it in
+/// the attribute `security.capability`: a `vfs_cap_data` of revision 2 (`0x02000000`) with the
+/// effective flag (`0x1`), and CAP_NET_RAW (bit 13) the one permitted capability, in
+/// little-endian words: magic, then the permitted and inheritable sets of capabilities 0 to 31,
+/// then of 32 to 63.
+pub const RAW_SOCKETS: [u8; 20] = [
+    0x01, 0x00, 0x00, 0x02, // the revision and the effective flag
+    0x00, 0x20, 0x00, 0x00, // permitted: CAP_NET_RAW
+    0x00, 0x00, 0x00, 0x00, // inheritable: none
+    0x00, 0x00, 0x00, 0x00, // permitted, 32 to 63: none
+    0x00, 0x00, 0x00, 0x00, // inheritable, 32 to 63: none
+];
+
+/// Whether a tool in `dir` can have raw sockets from a file capability: the system ignores file
+/// capabilities in a process with `no_new_privs`, and on a filesystem mounted `nosuid`; and it
+/// refuses to start a program whose capability it cannot give, as when CAP_NET_RAW is not in the
+/// bounding set, which a container may drop it from. A state that cannot be read is no reason:
+/// the capability's own failure then says what went wrong.
+#[cfg(target_os = "linux")]
+fn raw_sockets_possible(dir: &Path) -> Result<(), String> {
+    use rustix::fs::StatVfsMountFlags;
+    use rustix::thread::CapabilitySet;
+
+    if rustix::thread::no_new_privs().unwrap_or(false) {
+        return Err(locale::words().raw_sockets_no_new_privs());
+    }
+    if !rustix::thread::capability_is_in_bounding_set(CapabilitySet::NET_RAW).unwrap_or(true) {
+        return Err(locale::words().raw_sockets_bounded());
+    }
+    match rustix::fs::statvfs(dir) {
+        Ok(stat) if stat.f_flag.contains(StatVfsMountFlags::NOSUID) => {
+            Err(locale::words().raw_sockets_nosuid())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// File capabilities are Linux's.
+#[cfg(not(target_os = "linux"))]
+fn raw_sockets_possible(_dir: &Path) -> Result<(), String> {
+    Err(locale::words().raw_sockets_linux_only())
+}
+
+/// Gives the tool at `path` raw sockets ([`RAW_SOCKETS`]); it needs root, or CAP_SETFCAP.
+#[cfg(target_os = "linux")]
+fn grant_raw_sockets(path: &Path) -> Result<(), String> {
+    rustix::fs::setxattr(
+        path,
+        "security.capability",
+        &RAW_SOCKETS,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .map_err(|err| locale::words().raw_sockets_failed(&io::Error::from(err)))
+}
+
+/// File capabilities are Linux's.
+#[cfg(not(target_os = "linux"))]
+fn grant_raw_sockets(_path: &Path) -> Result<(), String> {
+    Err(locale::words().raw_sockets_linux_only())
 }
 
 /// Streams `body`, the whole file, into `path`, and checks its size and SHA-256. A body that

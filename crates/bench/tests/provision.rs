@@ -32,6 +32,7 @@ use bench_api::Context;
 use bench_api::Descriptor;
 use bench_api::FileSource;
 use bench_api::FileSpec;
+use bench_api::IpFamily;
 use bench_api::Net;
 use bench_api::Plugin;
 use bench_api::Requirements;
@@ -67,6 +68,7 @@ const fn asset(arch: &'static str, sha256: &'static str, size: u64) -> ToolAsset
 const FIO: ToolSpec = ToolSpec {
     name: "fio",
     version: "3.39",
+    raw_sockets: false,
     form: ToolForm::Executable,
     assets: &[
         asset("x86_64", SCRIPT_SHA, SCRIPT_LEN),
@@ -155,6 +157,7 @@ async fn install_rejects_a_truncated_download() {
 const IPERF3_ARM_ONLY: ToolSpec = ToolSpec {
     name: "iperf3",
     version: "3.19",
+    raw_sockets: false,
     form: ToolForm::Executable,
     assets: &[ToolAsset {
         arch: "aarch64",
@@ -167,6 +170,7 @@ const IPERF3_ARM_ONLY: ToolSpec = ToolSpec {
 const SYSBENCH: ToolSpec = ToolSpec {
     name: "sysbench",
     version: "1.0.20",
+    raw_sockets: false,
     form: ToolForm::Executable,
     assets: &[ToolAsset {
         arch: "x86_64",
@@ -345,6 +349,7 @@ fn pinned_to(body: &[u8]) -> ToolSpec {
     ToolSpec {
         name: "big",
         version: "1.0",
+        raw_sockets: false,
         form: ToolForm::Executable,
         assets,
     }
@@ -1037,13 +1042,189 @@ async fn nothing_is_downloaded_after_ctrl_c() {
     );
 }
 
+/// A tool that needs raw sockets, pinned to `body`, named `name`.
+fn raw(name: &'static str, body: &[u8]) -> ToolSpec {
+    ToolSpec {
+        name,
+        raw_sockets: true,
+        ..pinned_to(body)
+    }
+}
+
+/// Provisions `tool` into `dir`, serving `body` and counting the downloads asked for.
+async fn provision_counted(
+    tool: ToolSpec,
+    dir: &Path,
+    body: &'static [u8],
+) -> (Provisioned, usize) {
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let fetch = |_url, _range| {
+        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move { Ok(Part::Whole(body)) }
+    };
+    let cancel = CancellationToken::new();
+    let provisioned = provision_in_turn(&[tool], "x86_64", dir, &cancel, fetch).await;
+    (provisioned, asked.into_inner())
+}
+
+#[tokio::test]
+async fn a_tool_that_needs_raw_sockets_has_them_or_is_unavailable_with_the_reason() {
+    let dir = tempfile::tempdir().expect("a directory for the tool");
+    let (provisioned, asked) = provision_counted(raw("big", SCRIPT), dir.path(), SCRIPT).await;
+
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::StatVfsMountFlags;
+
+        let nosuid = rustix::fs::statvfs(dir.path())
+            .is_ok_and(|stat| stat.f_flag.contains(StatVfsMountFlags::NOSUID));
+        if rustix::thread::no_new_privs().unwrap_or(false) {
+            assert!(
+                provisioned.failed["big"].contains("no_new_privs"),
+                "{provisioned:?}"
+            );
+            assert_eq!(asked, 0, "not downloaded");
+        } else if nosuid {
+            assert!(
+                provisioned.failed["big"].contains("mounted nosuid"),
+                "{provisioned:?}"
+            );
+            assert_eq!(asked, 0, "not downloaded");
+        } else if rustix::process::geteuid().is_root() {
+            let path = &provisioned.ready["big"];
+            let mut capability = [0_u8; 64];
+            let length = rustix::fs::getxattr(path, "security.capability", &mut capability)
+                .expect("the tool has a file capability");
+            assert_eq!(capability[..length], provision::RAW_SOCKETS);
+        } else {
+            let reason = &provisioned.failed["big"];
+            assert!(
+                reason
+                    .starts_with("cannot give it raw sockets (the file capability CAP_NET_RAW): ")
+                    && reason.contains("not permitted"),
+                "only root may set a file capability: {reason}"
+            );
+            assert_eq!(asked, 1);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(
+            provisioned.failed["big"],
+            "it needs raw sockets, which the program gives on Linux only"
+        );
+        assert_eq!(asked, 0, "not downloaded");
+    }
+}
+
+/// The file capability as setcap writes `cap_net_raw+ep`: `getfattr -n security.capability`
+/// shows it as `0x0100000200200000000000000000000000000000`.
+#[test]
+fn the_raw_sockets_capability_is_cap_net_raw_ep_as_setcap_writes_it() {
+    let hex: String = provision::RAW_SOCKETS
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(hex, "0100000200200000000000000000000000000000");
+}
+
+/// /dev/shm, where Linux mounts it `nosuid` as most systems do; skipped where it is not.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_tool_that_needs_raw_sockets_is_not_downloaded_onto_a_filesystem_mounted_nosuid() {
+    use rustix::fs::StatVfsMountFlags;
+
+    let shm = Path::new("/dev/shm");
+    let Ok(stat) = rustix::fs::statvfs(shm) else {
+        return;
+    };
+    if !stat.f_flag.contains(StatVfsMountFlags::NOSUID) {
+        return;
+    }
+    let dir = tempfile::tempdir_in(shm).expect("a directory in /dev/shm");
+    let (provisioned, asked) = provision_counted(raw("big", SCRIPT), dir.path(), SCRIPT).await;
+    assert_eq!(
+        provisioned.failed["big"],
+        "it needs raw sockets, but the run directory's filesystem is mounted nosuid, which \
+         ignores file capabilities; choose another with --work-dir"
+    );
+    assert_eq!(asked, 0, "not downloaded");
+}
+
+/// As root on Linux, a tool with raw sockets runs as nobody with CAP_NET_RAW and nothing else, as
+/// the kernel reads the capability that the program wrote; the shell stands for the tool. Root
+/// only, as in the Linux check: the tests run as an ordinary user elsewhere.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_tool_with_raw_sockets_runs_as_nobody_with_cap_net_raw_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use bench_tool::job::Job;
+    use bench_tool::job::User;
+
+    if !rustix::process::geteuid().is_root() {
+        return;
+    }
+    let shell: &'static [u8] = Box::leak(
+        std::fs::read("/bin/sh")
+            .expect("the system's shell")
+            .into_boxed_slice(),
+    );
+    // As the program has it: a tools directory that others may search, in one closed to them.
+    let closed = tempfile::tempdir().expect("a run directory");
+    std::fs::set_permissions(closed.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("the run directory is closed to others");
+    let tools = closed.path().join("tools");
+    std::fs::create_dir(&tools).expect("a tools directory");
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o711))
+        .expect("the tools directory's mode");
+    // Busybox picks its program by its own name, which the copy keeps.
+    let (provisioned, _) = provision_counted(raw("sh", shell), &tools, shell).await;
+    let Some(tool) = provisioned.ready.get("sh").cloned() else {
+        panic!("the shell has raw sockets: {provisioned:?}");
+    };
+
+    let (ctx, _channels) = Context::<fio::Output>::new(
+        Arc::new(bench_host::profile::HostProfile::default()),
+        Arc::default(),
+        Arc::default(),
+        Instant::now() + Duration::from_secs(60),
+        closed.path().to_path_buf(),
+        CancellationToken::new(),
+    );
+    // The shell's own status: grep, which it starts, has no capability of its own.
+    let script = "grep -E '^Cap(Prm|Eff):' /proc/$$/status; id -u";
+    let mut job = Job::new(&tool, ["-c", script], Duration::from_secs(30));
+    job.user = Some(User::NOBODY);
+    job.dir = Some("/".into());
+    let ended = job.run(&ctx).await.ended;
+    let Ok(output) = &ended else {
+        panic!("the tool runs: {ended:?}");
+    };
+    let lines: Vec<Vec<&str>> = output
+        .text
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            vec!["CapPrm:", "0000000000002000"],
+            vec!["CapEff:", "0000000000002000"],
+            vec!["65534"],
+        ],
+        "CAP_NET_RAW, bit 13, permitted and effective, as nobody: {}",
+        output.text
+    );
+}
+
 const LIST_URL: &str = "https://lists.example/servers.json";
 
+/// The families of a host that reaches both.
+const BOTH: [IpFamily; 2] = [IpFamily::Ipv4, IpFamily::Ipv6];
+
 fn list(url: &str) -> FileSpec {
-    FileSpec {
-        name: "servers",
-        source: FileSource::Url(url.to_owned()),
-    }
+    FileSpec::new("servers", FileSource::Url(url.to_owned()))
 }
 
 /// What came of fetching files: the result, the log, the files left in their directory with
@@ -1060,9 +1241,9 @@ async fn fetch_from(files: &[FileSpec], served: &Served) -> Fetched {
     let dir = tempfile::tempdir().expect("a directory for the files");
     let (log, capturing) = Captured::start(true);
     let started = Instant::now();
-    let fetch = |_, range| served.open(range);
-    let provisioned =
-        provision::fetch_files(files, dir.path(), &CancellationToken::new(), &fetch).await;
+    let fetch = |_, _, range| served.open(range);
+    let cancel = CancellationToken::new();
+    let provisioned = provision::fetch_files(files, dir.path(), &BOTH, &cancel, &fetch).await;
     let took = started.elapsed();
     drop(capturing);
     let left = entries(dir.path())
@@ -1083,10 +1264,10 @@ async fn fetch_from(files: &[FileSpec], served: &Served) -> Fetched {
 #[tokio::test]
 async fn a_file_at_an_https_address_is_downloaded_and_one_on_the_host_handed_on() {
     let served = Served::new(b"{\"version\": 1}\n");
-    let own = FileSpec {
-        name: "own",
-        source: FileSource::Path(PathBuf::from("/etc/own-servers.json")),
-    };
+    let own = FileSpec::new(
+        "own",
+        FileSource::Path(PathBuf::from("/etc/own-servers.json")),
+    );
 
     let fetched = fetch_from(&[list(LIST_URL), own], &served).await;
 
@@ -1187,12 +1368,73 @@ async fn a_file_is_tried_again_after_failures_that_may_pass() {
 }
 
 #[tokio::test]
+async fn a_file_comes_over_its_family_and_one_of_a_family_the_host_lacks_is_not_fetched() {
+    let dir = tempfile::tempdir().expect("a directory for the files");
+    let asked = Mutex::new(Vec::new());
+    let fetch = |family: Option<IpFamily>, url: &'static str, _range| {
+        asked
+            .lock()
+            .expect("no test panics while holding it")
+            .push((family, url));
+        async { Ok(Part::Whole(&b"{}\n"[..])) }
+    };
+    let over = |name, url: &str, family| FileSpec {
+        family,
+        ..FileSpec::new(name, FileSource::Url(url.to_owned()))
+    };
+    let files = [
+        over("any", "https://lists.example/any.json", None),
+        over(
+            "four",
+            "https://lists.example/four.json",
+            Some(IpFamily::Ipv4),
+        ),
+        over(
+            "six",
+            "https://lists.example/six.json",
+            Some(IpFamily::Ipv6),
+        ),
+    ];
+
+    let (_log, capturing) = Captured::start(false);
+    let cancel = CancellationToken::new();
+    let provisioned =
+        provision::fetch_files(&files, dir.path(), &[IpFamily::Ipv4], &cancel, &fetch).await;
+    drop(capturing);
+
+    assert_eq!(
+        provisioned.ready,
+        BTreeMap::from([
+            ("any".to_owned(), dir.path().join("any")),
+            ("four".to_owned(), dir.path().join("four")),
+        ])
+    );
+    assert_eq!(
+        provisioned.failed,
+        BTreeMap::from([(
+            "six".to_owned(),
+            "not fetched: the host has no IPv6 connection".to_owned()
+        )])
+    );
+    assert_eq!(
+        asked
+            .into_inner()
+            .expect("no test panicked while holding it"),
+        [
+            (None, "https://lists.example/any.json"),
+            (Some(IpFamily::Ipv4), "https://lists.example/four.json"),
+        ],
+        "each over its family, and the IPv6 file not at all"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_c_stops_a_file_download_and_the_files_after_it() {
     let dir = tempfile::tempdir().expect("a directory for the files");
     let cancel = CancellationToken::new();
     let asked = Mutex::new(Vec::new());
     // The first file never comes, and Ctrl-C comes meanwhile.
-    let fetch = |url: &'static str, _range| {
+    let fetch = |_family, url: &'static str, _range| {
         asked
             .lock()
             .expect("no test panics while holding it")
@@ -1203,14 +1445,14 @@ async fn ctrl_c_stops_a_file_download_and_the_files_after_it() {
             std::future::pending::<Result<Part<&'static [u8]>, DownloadError>>().await
         }
     };
-    let other = FileSpec {
-        name: "other",
-        source: FileSource::Url("https://lists.example/other.json".to_owned()),
-    };
+    let other = FileSpec::new(
+        "other",
+        FileSource::Url("https://lists.example/other.json".to_owned()),
+    );
     let files = [list(LIST_URL), other];
 
     let (_log, capturing) = Captured::start(false);
-    let provisioned = provision::fetch_files(&files, dir.path(), &cancel, &fetch).await;
+    let provisioned = provision::fetch_files(&files, dir.path(), &BOTH, &cancel, &fetch).await;
     drop(capturing);
 
     assert_eq!(provisioned.ready, BTreeMap::new());

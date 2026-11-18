@@ -3,6 +3,8 @@
 use std::fmt::Display;
 use std::path::Path;
 
+use bench_api::IpFamily;
+
 use super::English;
 use crate::locale::Download;
 use crate::locale::DownloadWords;
@@ -80,6 +82,14 @@ impl DownloadWords for English {
         format!("not an HTTPS address: {url}")
     }
 
+    fn family_unreachable(&self, family: IpFamily) -> String {
+        let family = match family {
+            IpFamily::Ipv4 => "IPv4",
+            IpFamily::Ipv6 => "IPv6",
+        };
+        format!("not fetched: the host has no {family} connection")
+    }
+
     fn wrong_size(&self, size: u64, actual: u64) -> String {
         format!("size mismatch: {size} bytes pinned, {actual} bytes came")
     }
@@ -106,6 +116,32 @@ impl DownloadWords for English {
 
     fn install_failed(&self, error: &dyn Display) -> String {
         format!("cannot install: {error}")
+    }
+
+    fn raw_sockets_linux_only(&self) -> String {
+        "it needs raw sockets, which the program gives on Linux only".to_owned()
+    }
+
+    fn raw_sockets_no_new_privs(&self) -> String {
+        "it needs raw sockets, but the program runs with no_new_privs, which makes the system \
+         ignore file capabilities"
+            .to_owned()
+    }
+
+    fn raw_sockets_bounded(&self) -> String {
+        "it needs raw sockets, but CAP_NET_RAW is not in the program's capability bounding set, \
+         as in a container that drops it"
+            .to_owned()
+    }
+
+    fn raw_sockets_nosuid(&self) -> String {
+        "it needs raw sockets, but the run directory's filesystem is mounted nosuid, which \
+         ignores file capabilities; choose another with --work-dir"
+            .to_owned()
+    }
+
+    fn raw_sockets_failed(&self, error: &dyn Display) -> String {
+        format!("cannot give it raw sockets (the file capability CAP_NET_RAW): {error}")
     }
 
     fn unpack_failed(&self, error: &dyn Display) -> String {

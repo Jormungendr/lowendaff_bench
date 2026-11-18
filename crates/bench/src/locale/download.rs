@@ -4,6 +4,8 @@
 use std::fmt::Display;
 use std::path::Path;
 
+use bench_api::IpFamily;
+
 /// What a download gets, as the `-v` log names it.
 #[derive(Debug, Clone, Copy)]
 pub enum Download<'a> {
@@ -65,6 +67,8 @@ pub trait DownloadWords {
     fn file_too_large(&self, limit: u64) -> String;
     /// A file that a plugin asked for, at an address that is not HTTPS.
     fn not_https(&self, url: &str) -> String;
+    /// A file to fetch over an IP version that the host cannot reach, which is not fetched.
+    fn family_unreachable(&self, family: IpFamily) -> String;
     /// A whole file of another size than its pinned one.
     fn wrong_size(&self, size: u64, actual: u64) -> String;
     /// A byte range larger than its length.
@@ -79,6 +83,16 @@ pub trait DownloadWords {
     fn read_failed(&self, error: &dyn Display) -> String;
     /// A checked tool that could not be made executable or moved in place.
     fn install_failed(&self, error: &dyn Display) -> String;
+    /// A tool that needs raw sockets, on a system other than Linux.
+    fn raw_sockets_linux_only(&self) -> String;
+    /// A tool that needs raw sockets, in a process with `no_new_privs`.
+    fn raw_sockets_no_new_privs(&self) -> String;
+    /// A tool that needs raw sockets, in a process whose bounding set lacks CAP_NET_RAW.
+    fn raw_sockets_bounded(&self) -> String;
+    /// A tool that needs raw sockets, in a run directory on a filesystem mounted `nosuid`.
+    fn raw_sockets_nosuid(&self) -> String;
+    /// A tool whose file capability could not be set.
+    fn raw_sockets_failed(&self, error: &dyn Display) -> String;
     /// An archive that could not be unpacked.
     fn unpack_failed(&self, error: &dyn Display) -> String;
     /// An archive that holds a damaged entry.
