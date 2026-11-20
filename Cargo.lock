@@ -84,7 +84,7 @@ dependencies = [
  "insta",
  "plugin-cpu",
  "plugin-disk",
- "plugin-media",
+ "plugin-ip",
  "plugin-memory",
  "plugin-network",
  "reqwest",
@@ -925,7 +925,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin-media"
+name = "plugin-ip"
 version = "0.1.0"
 dependencies = [
  "bench-api",

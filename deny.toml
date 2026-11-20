@@ -38,7 +38,7 @@ deny = [
         "bench-tool",
         "plugin-cpu",
         "plugin-disk",
-        "plugin-media",
+        "plugin-ip",
         "plugin-memory",
         "plugin-network",
     ] },
@@ -55,7 +55,7 @@ deny = [
     { crate = "plugin-disk", reason = "plugin crates are used by bench alone", wrappers = [
         "bench",
     ] },
-    { crate = "plugin-media", reason = "plugin crates are used by bench alone", wrappers = [
+    { crate = "plugin-ip", reason = "plugin crates are used by bench alone", wrappers = [
         "bench",
     ] },
     { crate = "plugin-memory", reason = "plugin crates are used by bench alone", wrappers = [

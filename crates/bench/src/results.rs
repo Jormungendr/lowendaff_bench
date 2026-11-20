@@ -5,7 +5,8 @@ use plugin_cpu::geekbench;
 use plugin_cpu::sysbench;
 use plugin_disk::fio;
 use plugin_disk::health;
-use plugin_media::unlock;
+use plugin_ip::media;
+use plugin_ip::quality;
 use plugin_memory::latency;
 use plugin_memory::numa;
 use plugin_memory::stream;
@@ -45,6 +46,8 @@ pub enum Measured {
     NetworkIperf3(Report<iperf3::Output, iperf3::Failure>),
     /// Route tracing (`network.trace`).
     NetworkTrace(Report<trace::Output, trace::Failure>),
-    /// Media unlock (`media.unlock`).
-    MediaUnlock(Report<unlock::Output, unlock::Failure>),
+    /// IP reputation (`ip.quality`).
+    IpQuality(Report<quality::Output, quality::Failure>),
+    /// Media unlock (`ip.media`).
+    IpMedia(Report<media::Output, media::Failure>),
 }

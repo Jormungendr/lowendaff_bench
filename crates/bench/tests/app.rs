@@ -1393,7 +1393,7 @@ fn the_list_keeps_each_group_together_in_the_reports_order() {
             "[Memory performance] (group: memory)",
             "[Disks] (group: disk)",
             "[Network] (group: network)",
-            "[Streaming media] (group: media)"
+            "[IP] (group: ip)"
         ]
     );
     let ids: Vec<&str> = text
@@ -1414,7 +1414,8 @@ fn the_list_keeps_each_group_together_in_the_reports_order() {
             "disk.fio",
             "network.iperf3",
             "network.trace",
-            "media.unlock"
+            "ip.quality",
+            "ip.media"
         ]
     );
     let cpu: Vec<&str> = text
@@ -1465,15 +1466,30 @@ fn the_list_keeps_each_group_together_in_the_reports_order() {
             "  network.trace  Route tracing (tools: nexttrace 1.7.6)"
         ]
     );
-    let media: Vec<&str> = text
+    let ip: Vec<&str> = text
         .lines()
-        .filter(|line| line.starts_with("  media."))
+        .filter(|line| line.starts_with("  ip."))
         .collect();
-    assert_eq!(media, ["  media.unlock  Media unlock"]);
+    assert_eq!(
+        ip,
+        ["  ip.quality  IP reputation", "  ip.media  Media unlock"]
+    );
 }
 
 #[test]
 fn the_plan_keeps_the_reporters_names() {
+    let planned = app::prepare(&cli(&["--only", "ip"]), &registry::all()).unwrap();
+    let names: Vec<(&str, Option<&str>)> = planned
+        .iter()
+        .map(|planned| (planned.id(), planned.title()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("ip.quality", Some("IP reputation")),
+            ("ip.media", Some("Media unlock"))
+        ]
+    );
     let planned = app::prepare(&cli(&["--only", "cpu"]), &registry::all()).unwrap();
     let names: Vec<(&str, Option<&str>)> = planned
         .iter()
@@ -1526,5 +1542,5 @@ fn the_items_that_do_not_apply_here_are_named_as_the_report_names_them() {
     let (applicable, names) = orchestrator::for_host(planned, &vm);
 
     assert_eq!(names, ["Disk health", "Memory NUMA"]);
-    assert_eq!(applicable.len(), 9, "the others run");
+    assert_eq!(applicable.len(), 10, "the others run");
 }
