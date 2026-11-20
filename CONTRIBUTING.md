@@ -1,14 +1,15 @@
 # Contributing
 
 This guide holds the layout of the code, the steps to add a test item and the conventions that
-every change follows; CI enforces most of them (README "Gates"). The decisions behind them are
+every change follows; CI enforces most of them ("CI checks" below). The decisions behind them are
 recorded in design documents outside the repository.
 
 ## Languages
 
 - Code, identifiers, comments, commit messages and English documents (`README.md`,
-  `CONTRIBUTING.md`, `.github/`) are English; localized user documentation lives in
-  `README.zh-CN.md`, `README.ja.md` and `docs/*.md`.
+  `CONTRIBUTING.md`, `.github/pull_request_template.md`, `.github/workflows/`) are English;
+  localized user documentation lives in `README.zh-CN.md`, `README.ja.md` and `docs/*.md`, and
+  `.github/ISSUE_TEMPLATE/` holds bilingual English/Chinese issue forms.
 - Text that the program shows its users is English, and comes from the message catalog in
   `crates/bench/src/locale/`: a trait per part of the program, which each language implements
   in a module of its own. Messages for developers, such as the registry checks, are English and
@@ -17,9 +18,10 @@ recorded in design documents outside the repository.
   every trait, listed in `LOCALES`; the compiler names each text it still lacks. The locale comes
   from `LC_ALL`, `LC_MESSAGES` or `LANG`. The tests expect the English catalog, which
   `LC_ALL=C` selects.
-- Outside localized Markdown documents (`README.zh-CN.md`, `README.ja.md`, `docs/*.md`) and
-  catalogs of other languages, no tracked file holds a CJK character, so that code, tests,
-  fixtures, scripts and comments stay English (`scripts/check-docs.sh`).
+- Outside localized Markdown documents (`README.zh-CN.md`, `README.ja.md`, `docs/*.md`),
+  bilingual issue templates (`.github/ISSUE_TEMPLATE/`) and catalogs of other languages, no
+  tracked file holds a CJK character, so that code, tests, fixtures, scripts and comments stay
+  English (`scripts/check-docs.sh`).
 - Pull request bodies are English, in the sections of the template.
 
 ## Layout
@@ -61,11 +63,11 @@ Its tests are `plugins/<group>/tests/<name>_*.rs`, with the tool's recorded outp
 memory plugins' working-set plan. Every plugin calls its types `Output` and `Failure`, written
 with the module, as in `stream::Output`.
 
-A run goes this way: the program reads its arguments and checks for root, builds the selected
-plugins from their config in the registry's order, reads the host profile, leaves out the plugins
+A run goes this way: the program reads its command-line arguments and checks for root, builds the
+selected plugins in the registry's order, reads the host profile, leaves out the plugins
 that do not apply to the host, downloads the tools of the others, runs each plugin with its time
-limit while its progress goes to stderr, and writes the report to stdout once every plugin is
-done.
+limit while its progress goes to stderr, and writes the report to stdout (or `--output`) once
+every plugin is done.
 
 ## Adding a test item
 
@@ -85,9 +87,8 @@ A new test item starts with a design document (below). Then:
    catalog's `group_title`.
 4. Test the parsers with recorded output, the measurement with recorded runs, comparing each
    tool's whole command, and the words with insta snapshots in `crates/bench/tests/`.
-5. Add the item to the README's table of items, and its tool to the table of third-party tools;
-   a new tool is built and released first (README "Third-party tools"), then pinned in
-   `crates/bench-tool`.
+5. Add the item to the README's table of items, and its tool to "Third-party tools" below;
+   a new tool is built and released first, then pinned in `crates/bench-tool`.
 6. A new group's crate depends on `bench-api` and `bench-tool` along the direction below: it
    joins their `wrappers` lists in `deny.toml` and gets an entry of its own, used by `bench`
    alone. The rule against printing covers `plugins/*/src` already.
@@ -123,8 +124,8 @@ formatted by `rustfmt` with its default settings (the guide's nightly-only optio
 used), with these rules of this repository:
 
 - Call free functions through their module; import types unqualified, except common names such
-  as `io::Error` and `toml::Value`; import a trait inside the function that uses it, unless the
-  whole file does; one item per `use` (ast-grep rules `call-functions-through-module` and
+  as `io::Error` and `serde_json::Value`; import a trait inside the function that uses it, unless
+  the whole file does; one item per `use` (ast-grep rules `call-functions-through-module` and
   `use-one-item`).
 - Name constructors `new` or `new_*`, or `try_new` when they return a `Result`. Implement
   `Display` instead of writing label helpers. Name a module after its primary type, without
@@ -189,8 +190,8 @@ used), with these rules of this repository:
 - Lines are at most 98 columns, so that the squash commit's two-column bullet still fits in 100.
   ASCII only, no `Co-authored-by` trailers and no merge commits.
 
-Every commit also builds and passes the gates on its own, with `--locked`;
-`scripts/verify-commits.sh` checks a branch for this (README "Gates").
+Every commit also builds and passes the checks on its own, with `--locked`;
+`scripts/verify-commits.sh` checks a branch for this ("CI checks" below).
 
 ## Pull requests
 
@@ -202,8 +203,8 @@ Every commit also builds and passes the gates on its own, with `--locked`;
 - A pull request is merged only with the owner's approval and with every check green on its
   exact head; its branch is then deleted.
 - Once CI has passed, add further fixes as new commits on top instead of rewriting the branch.
-  CI reuses an earlier full validation only for commits that descend from the validated one
-  (README "Gates"), so a rewritten branch runs the whole suite again.
+  CI reuses an earlier full validation only for commits that descend from the validated one, so a
+  rewritten branch runs the whole suite again.
 - A failed check is investigated with its log, not retried. Only a failure caused by an outage of
   GitHub itself is rerun, once GitHub has recovered, and at most three times.
 - Dependabot's pull requests skip the commit check; their squash message is rewritten at merge,
@@ -224,3 +225,40 @@ A test item, or a change to the model, starts with a design document that holds:
 A decision that a later one replaces stays in place, and the later document says so. Design
 documents are kept outside the repository until they are published, so nothing in the repository
 points into them: a comment or a document gives the reason itself.
+
+## Third-party tools
+
+External tools are built reproducibly by `.github/workflows/tools.yml` from `scripts/build-*.sh`
+and published as immutable GitHub releases of this repository (with sources, licenses and
+`SHA256SUMS`), except Geekbench 7, whose license forbids redistribution and which is downloaded
+directly from `cdn.geekbench.com` under its pinned SHA-256 and size:
+
+- `fio` 3.43 with `libaio` 0.3.113 static (`GPL-2.0`; `LGPL-2.1`) — `fio-3.43-2` (`disk.fio`)
+- `iperf3` 3.22 without OpenSSL or SCTP (`BSD-3-Clause`) — `iperf3-3.22-1` (`network.iperf3`)
+- `smartctl` 7.5 from smartmontools (`GPL-2.0-or-later`) — `smartctl-7.5-1` (`disk.health`)
+- `sysbench` 1.0.20 (`GPL-2.0-or-later`; `MIT`; `BSD-2-Clause`) — `sysbench-1.0.20-1`
+  (`cpu.sysbench`, `memory.sysbench`)
+- `STREAM` 5.10 for six array sizes (STREAM license) — `stream-5.10-1` (`memory.stream`)
+- `NextTrace` 1.7.6 tiny flavor (`GPL-3.0`; `BSD-3-Clause`) — `nexttrace-1.7.6-1`
+  (`network.trace`)
+- `multichase` and `multiload` `8b68e918` with `glibc` 2.41 static (`Apache-2.0`; `LGPL-2.1`) —
+  `multichase-2026.10.01-1` (`memory.latency`, `memory.numa`)
+
+## CI checks
+
+`.github/workflows/ci.yml` and `.github/workflows/commits.yml` run these checks; run the local
+ones before pushing:
+
+- `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo nextest run --workspace --locked --no-fail-fast` and
+  `cargo nextest run -p bench --test tools --locked --run-ignored only`
+- `cargo deny check`, `zizmor --persona pedantic .`, `actionlint`, and `shellcheck` across `*.sh`
+- `scripts/check-commits-cases.sh` and `scripts/check-commits.sh origin/main HEAD`
+- `ast-grep test`, `ast-grep scan`, `scripts/check-docs-cases.sh` and `scripts/check-docs.sh`
+- `scripts/{iperf3-servers,traceroute-targets,netflix-ix}{-cases,}.sh` (`check` subcommand)
+- On Linux (`x86_64` and `aarch64`): static `musl` release build, `swap-file` roundtrip example,
+  `scripts/smoke.sh` with local loopback responders (`smoke-{iperf3,trace,ip,media}.sh`),
+  `scripts/smoke-mutants.sh`, `scripts/distros.sh`, and non-blocking `scripts/network-check.sh`.
+
+CI pins `cargo-nextest` `0.9.151`, `cargo-deny` `0.20.2`, `zizmor` `1.32.0`, `ast-grep` `0.51.1`,
+`shellcheck` `0.11.0`, and `actionlint` `1.7.12`.
